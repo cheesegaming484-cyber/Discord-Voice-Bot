@@ -1,7 +1,9 @@
 import {
+  ChannelType,
   Client,
   GatewayIntentBits,
   MessageFlags,
+  PermissionFlagsBits,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -15,6 +17,8 @@ import {
   type AudioPlayer,
   type VoiceConnection,
 } from "@discordjs/voice";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import googleTTS from "google-tts-api";
 import ffmpegPath from "ffmpeg-static";
 import { logger } from "./lib/logger";
@@ -43,8 +47,18 @@ if (ffmpegPath && !process.env["FFMPEG_PATH"]) {
 
 const commands = [
   new SlashCommandBuilder()
+    .setName("join")
+    .setDescription("Join a voice channel.")
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("The voice channel to join")
+        .addChannelTypes(ChannelType.GuildVoice)
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
     .setName("speak")
-    .setDescription("Converts text to speech and plays it in your voice channel.")
+    .setDescription("Convert text to speech in the bot's joined voice channel.")
     .addStringOption((option) =>
       option
         .setName("message")
@@ -52,6 +66,26 @@ const commands = [
         .setRequired(true)
         .setMaxLength(200),
     ),
+  new SlashCommandBuilder()
+    .setName("blacklist")
+    .setDescription("Prevent a server member from using speech.")
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("The member to block from using /speak")
+        .setRequired(true),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName("unblacklist")
+    .setDescription("Allow a server member to use speech again.")
+    .addUserOption((option) =>
+      option
+        .setName("user")
+        .setDescription("The member to allow to use /speak")
+        .setRequired(true),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((command) => command.toJSON());
 
 const client = new Client({
@@ -62,9 +96,57 @@ type GuildPlayback = {
   connection: VoiceConnection;
   player: AudioPlayer;
   cleanupTimer?: NodeJS.Timeout;
+  voiceChannelId: string;
+  stayConnected: boolean;
 };
 
 const activePlayback = new Map<string, GuildPlayback>();
+const speechBlacklist = new Map<string, Set<string>>();
+const blacklistFile = path.resolve("data/speech-blacklist.json");
+
+async function loadSpeechBlacklist() {
+  try {
+    const raw = await readFile(blacklistFile, "utf8");
+    const saved = JSON.parse(raw) as Record<string, unknown>;
+
+    for (const [guildId, users] of Object.entries(saved)) {
+      if (Array.isArray(users) && users.every((userId) => typeof userId === "string")) {
+        speechBlacklist.set(guildId, new Set(users));
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.error({ err: error }, "Could not load speech blacklist");
+    }
+  }
+}
+
+async function saveSpeechBlacklist() {
+  const data = Object.fromEntries(
+    [...speechBlacklist.entries()].map(([guildId, users]) => [
+      guildId,
+      [...users],
+    ]),
+  );
+  const tempFile = `${blacklistFile}.tmp`;
+
+  await mkdir(path.dirname(blacklistFile), { recursive: true });
+  await writeFile(tempFile, JSON.stringify(data, null, 2), "utf8");
+  await rename(tempFile, blacklistFile);
+}
+
+function isSpeechBlacklisted(guildId: string, userId: string) {
+  return speechBlacklist.get(guildId)?.has(userId) ?? false;
+}
+
+function hasSpeechModerationPermission(
+  permissions: Readonly<import("discord.js").PermissionsBitField> | null,
+) {
+  return Boolean(
+    permissions?.has(PermissionFlagsBits.Administrator) ||
+      permissions?.has(PermissionFlagsBits.ManageGuild),
+  );
+}
 
 function destroyPlayback(guildId: string) {
   const playback = activePlayback.get(guildId);
@@ -81,7 +163,7 @@ function destroyPlayback(guildId: string) {
 
 function schedulePlaybackCleanup(guildId: string) {
   const playback = activePlayback.get(guildId);
-  if (!playback) return;
+  if (!playback || playback.stayConnected) return;
 
   playback.cleanupTimer = setTimeout(() => {
     const current = activePlayback.get(guildId);
@@ -89,6 +171,51 @@ function schedulePlaybackCleanup(guildId: string) {
       destroyPlayback(guildId);
     }
   }, 1_000);
+}
+
+function createPlayback(
+  guildId: string,
+  voiceChannelId: string,
+  adapterCreator: Parameters<typeof joinVoiceChannel>[0]["adapterCreator"],
+  stayConnected: boolean,
+) {
+  const existing = activePlayback.get(guildId);
+
+  if (existing?.voiceChannelId === voiceChannelId) {
+    existing.stayConnected = existing.stayConnected || stayConnected;
+    return existing;
+  }
+
+  if (existing) {
+    destroyPlayback(guildId);
+  }
+
+  const connection = joinVoiceChannel({
+    channelId: voiceChannelId,
+    guildId,
+    adapterCreator,
+    selfDeaf: true,
+  });
+  const player = createAudioPlayer();
+  const playback: GuildPlayback = {
+    connection,
+    player,
+    voiceChannelId,
+    stayConnected,
+  };
+
+  activePlayback.set(guildId, playback);
+
+  player.on(AudioPlayerStatus.Idle, () => {
+    schedulePlaybackCleanup(guildId);
+  });
+  player.on("error", (error) => {
+    logger.error({ err: error, guildId }, "Audio playback error");
+    destroyPlayback(guildId);
+  });
+
+  connection.subscribe(player);
+  return playback;
 }
 
 async function registerCommands() {
@@ -107,7 +234,7 @@ client.on("error", (error) => {
 });
 
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== "speak") {
+  if (!interaction.isChatInputCommand()) {
     return;
   }
 
@@ -119,39 +246,147 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
-  const member = await interaction.guild.members.fetch(interaction.user.id);
-  const voiceChannel = member.voice.channel;
-
-  if (!voiceChannel) {
-    await interaction.reply({
-      content: "Join a voice channel first, then try again.",
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  const text = interaction.options.getString("message", true).trim();
-
-  if (!text) {
-    await interaction.reply({
-      content: "Please provide a message for me to say.",
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  await interaction.deferReply();
-
   try {
-    destroyPlayback(interaction.guild.id);
+    if (interaction.commandName === "join") {
+      const selectedChannel = interaction.options.getChannel("channel", true);
+      const voiceChannel = interaction.guild.channels.cache.get(selectedChannel.id);
 
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: interaction.guild.id,
-      adapterCreator: interaction.guild.voiceAdapterCreator,
-      selfDeaf: true,
-    });
-    const player = createAudioPlayer();
+      if (!voiceChannel || voiceChannel.type !== ChannelType.GuildVoice) {
+        await interaction.reply({
+          content: "Choose a standard voice channel.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (!voiceChannel.joinable) {
+        await interaction.reply({
+          content: "I can't join that voice channel. Check my Connect permission.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      createPlayback(
+        interaction.guild.id,
+        voiceChannel.id,
+        interaction.guild.voiceAdapterCreator,
+        true,
+      );
+      await interaction.reply(`Joined **${voiceChannel.name}**.`);
+      return;
+    }
+
+    if (
+      interaction.commandName === "blacklist" ||
+      interaction.commandName === "unblacklist"
+    ) {
+      if (!hasSpeechModerationPermission(interaction.memberPermissions)) {
+        await interaction.reply({
+          content: "You need the Manage Server permission to change speech access.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const user = interaction.options.getUser("user", true);
+      const users = speechBlacklist.get(interaction.guild.id) ?? new Set<string>();
+      const currentlyBlacklisted = users.has(user.id);
+
+      if (interaction.commandName === "blacklist") {
+        users.add(user.id);
+        speechBlacklist.set(interaction.guild.id, users);
+        await saveSpeechBlacklist();
+        await interaction.reply(
+          currentlyBlacklisted
+            ? `<@${user.id}> is already blocked from using speech.`
+            : `<@${user.id}> can no longer use /speak.`,
+        );
+      } else {
+        users.delete(user.id);
+        if (users.size === 0) {
+          speechBlacklist.delete(interaction.guild.id);
+        } else {
+          speechBlacklist.set(interaction.guild.id, users);
+        }
+        await saveSpeechBlacklist();
+        await interaction.reply(
+          currentlyBlacklisted
+            ? `<@${user.id}> can use /speak again.`
+            : `<@${user.id}> was not on the speech blacklist.`,
+        );
+      }
+      return;
+    }
+
+    if (interaction.commandName !== "speak") {
+      return;
+    }
+
+    if (isSpeechBlacklisted(interaction.guild.id, interaction.user.id)) {
+      await interaction.reply({
+        content: "You are not allowed to use speech commands in this server.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const existingPlayback = activePlayback.get(interaction.guild.id);
+    const joinedChannel = existingPlayback?.stayConnected
+      ? interaction.guild.channels.cache.get(existingPlayback.voiceChannelId)
+      : undefined;
+    let voiceChannel =
+      joinedChannel?.type === ChannelType.GuildVoice ? joinedChannel : undefined;
+
+    if (!voiceChannel) {
+      const member = await interaction.guild.members.fetch(interaction.user.id);
+      const memberVoiceChannel = member.voice.channel;
+
+      if (!memberVoiceChannel) {
+        await interaction.reply({
+          content: "Use /join to choose a voice channel, or join one first.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (memberVoiceChannel.type !== ChannelType.GuildVoice) {
+        await interaction.reply({
+          content: "Choose a standard voice channel, then try again.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      voiceChannel = memberVoiceChannel;
+    }
+
+    if (!voiceChannel.joinable || !voiceChannel.speakable) {
+      await interaction.reply({
+        content: "I can't speak in that voice channel. Check my Connect and Speak permissions.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    const text = interaction.options.getString("message", true).trim();
+
+    if (!text) {
+      await interaction.reply({
+        content: "Please provide a message for me to say.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    const playback = createPlayback(
+      interaction.guild.id,
+      voiceChannel.id,
+      interaction.guild.voiceAdapterCreator,
+      false,
+    );
     const ttsUrl = googleTTS.getAudioUrl(text, {
       lang: "en",
       slow: false,
@@ -161,29 +396,31 @@ client.on("interactionCreate", async (interaction) => {
       inputType: StreamType.Arbitrary,
     });
 
-    const playback: GuildPlayback = { connection, player };
-    activePlayback.set(interaction.guild.id, playback);
-
-    player.on(AudioPlayerStatus.Idle, () => {
-      schedulePlaybackCleanup(interaction.guild!.id);
-    });
-    player.on("error", (error) => {
-      logger.error({ err: error, guildId: interaction.guildId }, "Audio playback error");
-      destroyPlayback(interaction.guildId!);
-    });
-
-    connection.subscribe(player);
-    player.play(resource);
-
+    playback.player.play(resource);
     await interaction.editReply(`Speaking: "${text}"`);
   } catch (error) {
     logger.error({ err: error, guildId: interaction.guildId }, "Failed to play audio");
-    destroyPlayback(interaction.guild.id);
-    await interaction.editReply("I couldn't play that message. Check that I can connect and speak in this voice channel.");
+    const playback = interaction.guildId
+      ? activePlayback.get(interaction.guildId)
+      : undefined;
+    if (playback && !playback.stayConnected) {
+      destroyPlayback(interaction.guildId!);
+    }
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(
+        "I couldn't complete that request. Check my channel permissions and try again.",
+      );
+    } else {
+      await interaction.reply({
+        content: "I couldn't complete that request. Check my channel permissions and try again.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
   }
 });
 
 export async function startDiscordBot() {
+  await loadSpeechBlacklist();
   await registerCommands();
   await client.login(token);
 }

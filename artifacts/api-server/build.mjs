@@ -100,6 +100,11 @@ async function buildAll() {
       "puppeteer",
       "puppeteer-core",
       "electron",
+      "discord.js",
+      "@discordjs/*",
+      "google-tts-api",
+      "ffmpeg-static",
+      "prism-media",
     ],
     sourcemap: "linked",
     plugins: [

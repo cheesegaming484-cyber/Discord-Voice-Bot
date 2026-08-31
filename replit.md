@@ -1,15 +1,15 @@
-# [Project name]
+# Discord Voice Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+An always-on Discord bot that turns `/speak` messages into speech in the user's current voice channel.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
+- `pnpm --filter @workspace/api-server run dev` — run the Discord bot and health server
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Required secrets: `DISCORD_TOKEN`, `CLIENT_ID`
 
 ## Stack
 
@@ -22,23 +22,25 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `artifacts/api-server/src/discord-bot.ts` — Discord client, slash-command registration, TTS generation, and voice playback
+- `artifacts/api-server/src/index.ts` — HTTP health server and Discord bot startup
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Discord credentials are read only from Replit Secrets.
+- The bot uses only the Guilds and Guild Voice States intents; message content access is not needed for slash commands.
+- Global slash-command registration keeps the bot invite flow simple and works across all servers where the bot is installed.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
-
-## User preferences
-
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- Users run `/speak message:<text>` while connected to a voice channel.
+- Google Text-to-Speech audio is converted through FFmpeg and played through Discord voice.
+- Playback connections are cleaned up after speech finishes.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- The bot needs Send Messages, Connect, and Speak permissions in each server.
+- Global slash-command updates can take a little time to propagate in Discord.
 
 ## Pointers
 

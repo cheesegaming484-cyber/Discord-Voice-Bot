@@ -45,6 +45,28 @@ if (ffmpegPath && !process.env["FFMPEG_PATH"]) {
   process.env["FFMPEG_PATH"] = ffmpegPath;
 }
 
+const VOICE_OPTIONS = {
+  english: { name: "English", lang: "en" },
+  spanish: { name: "Spanish", lang: "es" },
+  french: { name: "French", lang: "fr" },
+  german: { name: "German", lang: "de" },
+  italian: { name: "Italian", lang: "it" },
+  portuguese: { name: "Portuguese", lang: "pt" },
+  japanese: { name: "Japanese", lang: "ja" },
+  korean: { name: "Korean", lang: "ko" },
+  chinese: { name: "Chinese", lang: "zh-CN" },
+  russian: { name: "Russian", lang: "ru" },
+  arabic: { name: "Arabic", lang: "ar" },
+  tagalog: { name: "Tagalog", lang: "tl" },
+} as const;
+
+type VoiceKey = keyof typeof VOICE_OPTIONS;
+const DEFAULT_VOICE: VoiceKey = "english";
+const voiceChoices = Object.entries(VOICE_OPTIONS).map(([value, option]) => ({
+  name: option.name,
+  value,
+}));
+
 const commands = [
   new SlashCommandBuilder()
     .setName("join")
@@ -65,6 +87,26 @@ const commands = [
         .setDescription("The text you want the bot to say")
         .setRequired(true)
         .setMaxLength(200),
+    ),
+  new SlashCommandBuilder()
+    .setName("voice")
+    .setDescription("Choose the language voice used for speech.")
+    .addStringOption((option) =>
+      option
+        .setName("voice")
+        .setDescription("The language voice to use")
+        .addChoices(...voiceChoices)
+        .setRequired(true),
+    ),
+  new SlashCommandBuilder()
+    .setName("preview")
+    .setDescription("Preview a voice in the bot's current voice channel.")
+    .addStringOption((option) =>
+      option
+        .setName("voice")
+        .setDescription("Voice to preview, or leave empty for the server selection")
+        .addChoices(...voiceChoices)
+        .setRequired(false),
     ),
   new SlashCommandBuilder()
     .setName("blacklist")
@@ -102,7 +144,9 @@ type GuildPlayback = {
 
 const activePlayback = new Map<string, GuildPlayback>();
 const speechBlacklist = new Map<string, Set<string>>();
+const voicePreferences = new Map<string, VoiceKey>();
 const blacklistFile = path.resolve("data/speech-blacklist.json");
+const voicePreferencesFile = path.resolve("data/voice-preferences.json");
 
 async function loadSpeechBlacklist() {
   try {
@@ -135,8 +179,42 @@ async function saveSpeechBlacklist() {
   await rename(tempFile, blacklistFile);
 }
 
+async function loadVoicePreferences() {
+  try {
+    const raw = await readFile(voicePreferencesFile, "utf8");
+    const saved = JSON.parse(raw) as Record<string, unknown>;
+
+    for (const [guildId, voice] of Object.entries(saved)) {
+      if (typeof voice === "string" && voice in VOICE_OPTIONS) {
+        voicePreferences.set(guildId, voice as VoiceKey);
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      logger.error({ err: error }, "Could not load voice preferences");
+    }
+  }
+}
+
+async function saveVoicePreferences() {
+  const data = Object.fromEntries(voicePreferences.entries());
+  const tempFile = `${voicePreferencesFile}.tmp`;
+
+  await mkdir(path.dirname(voicePreferencesFile), { recursive: true });
+  await writeFile(tempFile, JSON.stringify(data, null, 2), "utf8");
+  await rename(tempFile, voicePreferencesFile);
+}
+
 function isSpeechBlacklisted(guildId: string, userId: string) {
   return speechBlacklist.get(guildId)?.has(userId) ?? false;
+}
+
+function getVoiceKey(guildId: string, requestedVoice?: string | null): VoiceKey {
+  if (requestedVoice && requestedVoice in VOICE_OPTIONS) {
+    return requestedVoice as VoiceKey;
+  }
+
+  return voicePreferences.get(guildId) ?? DEFAULT_VOICE;
 }
 
 function hasSpeechModerationPermission(
@@ -319,6 +397,65 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (interaction.commandName === "voice") {
+      const selectedVoice = getVoiceKey(
+        interaction.guild.id,
+        interaction.options.getString("voice", true),
+      );
+      voicePreferences.set(interaction.guild.id, selectedVoice);
+      await saveVoicePreferences();
+      await interaction.reply(
+        `Voice set to **${VOICE_OPTIONS[selectedVoice].name}** for this server.`,
+      );
+      return;
+    }
+
+    if (
+      interaction.commandName === "preview" &&
+      isSpeechBlacklisted(interaction.guild.id, interaction.user.id)
+    ) {
+      await interaction.reply({
+        content: "You are not allowed to use speech commands in this server.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (interaction.commandName === "preview") {
+      const playback = activePlayback.get(interaction.guild.id);
+      const joinedChannel = playback
+        ? interaction.guild.channels.cache.get(playback.voiceChannelId)
+        : undefined;
+
+      if (!playback || !joinedChannel || joinedChannel.type !== ChannelType.GuildVoice) {
+        await interaction.reply({
+          content: "I am not in a voice channel. Use /join and choose a voice channel first.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const selectedVoice = getVoiceKey(
+        interaction.guild.id,
+        interaction.options.getString("voice"),
+      );
+      const sampleText = `Hello. This is a preview of the ${VOICE_OPTIONS[selectedVoice].name} voice.`;
+      const ttsUrl = googleTTS.getAudioUrl(sampleText, {
+        lang: VOICE_OPTIONS[selectedVoice].lang,
+        slow: false,
+        host: "https://translate.google.com",
+      });
+      const resource = createAudioResource(ttsUrl, {
+        inputType: StreamType.Arbitrary,
+      });
+
+      playback.player.play(resource);
+      await interaction.reply(
+        `Previewing the **${VOICE_OPTIONS[selectedVoice].name}** voice in **${joinedChannel.name}**.`,
+      );
+      return;
+    }
+
     if (interaction.commandName !== "speak") {
       return;
     }
@@ -387,8 +524,9 @@ client.on("interactionCreate", async (interaction) => {
       interaction.guild.voiceAdapterCreator,
       false,
     );
+    const selectedVoice = getVoiceKey(interaction.guild.id);
     const ttsUrl = googleTTS.getAudioUrl(text, {
-      lang: "en",
+      lang: VOICE_OPTIONS[selectedVoice].lang,
       slow: false,
       host: "https://translate.google.com",
     });
@@ -421,6 +559,7 @@ client.on("interactionCreate", async (interaction) => {
 
 export async function startDiscordBot() {
   await loadSpeechBlacklist();
+  await loadVoicePreferences();
   await registerCommands();
   await client.login(token);
 }

@@ -105,6 +105,10 @@ async function buildAll() {
       "google-tts-api",
       "ffmpeg-static",
       "prism-media",
+      "play-dl",
+      "lyrics-finder",
+      "play-audio",
+      "play-opus",
     ],
     sourcemap: "linked",
     plugins: [

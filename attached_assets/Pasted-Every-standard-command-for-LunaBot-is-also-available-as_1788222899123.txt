@@ -1,0 +1,40 @@
+Every standard ! command for LunaBot is also available as a Discord slash command (/). Here is the complete list of slash commands organized by category:
+Playback & Queue
+ * /play [song] – Play a track, playlist, or search query.
+ * /playskip [song] – Add a song to the queue and instantly skip to it.
+ * /playtop [song] – Add a track to the very top of the queue.
+ * /pause – Pause the current song.
+ * /resume – Resume playback.
+ * /skip – Skip the current track.
+ * /back – Play the previous song.
+ * /replay – Replay the current track from the beginning.
+ * /stop – Stop the music player and clear the queue.
+ * /clear – Clear the entire queue without stopping.
+ * /queue – View the current song queue.
+ * /nowplaying – Show details and progress of the active track.
+ * /search [query] – Search YouTube and pick a track from a list.
+Navigation & Control
+ * /seek [timestamp] – Jump to a specific timestamp (e.g., 1:30).
+ * /forward [time] – Fast-forward playback by seconds.
+ * /rewind [time] – Rewind playback by seconds.
+ * /move [from] [to] – Move a specific song to a new position in the queue.
+ * /remove [position] – Remove a specific track from the queue.
+ * /shuffle – Shuffle the active queue.
+ * /loop [mode] – Set loop mode to off, song, or queue.
+Audio & Effects
+ * /volume [1-200] – Adjust the playback volume.
+ * /filters [filter] – Apply audio effects (bass boost, nightcore, speed, etc.).
+ * /autoplay – Toggle auto-queuing of recommended tracks.
+ * /lyrics – Fetch lyrics for the active track.
+Playlists
+ * /playlist create [name] – Create a custom playlist.
+ * /playlist add [name] [url] – Add a track to your custom playlist.
+ * /playlist list – View your saved playlists.
+ * /playlist play [name] – Load and play a saved playlist.
+ * /playlist delete [name] – Delete a playlist.
+Voice & Server Setup
+ * /join – Force the bot to join your current voice channel.
+ * /leave – Disconnect the bot from the voice channel.
+ * /setup – Generate a dedicated song-request channel with persistent UI buttons.
+ * /dj [set/remove/role] – Configure DJ roles for command permissions.
+ * /247 – Toggle 24/7 mode so the bot stays in the voice channel.

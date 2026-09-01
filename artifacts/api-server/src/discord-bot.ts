@@ -9,19 +9,20 @@ import {
   SlashCommandBuilder,
 } from "discord.js";
 import {
-  AudioPlayerStatus,
-  createAudioPlayer,
   createAudioResource,
-  joinVoiceChannel,
   StreamType,
-  type AudioPlayer,
-  type VoiceConnection,
 } from "@discordjs/voice";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import googleTTS from "google-tts-api";
 import ffmpegPath from "ffmpeg-static";
 import { logger } from "./lib/logger";
+import {
+  activePlayback,
+  createPlayback,
+  destroyPlayback,
+} from "./voice-manager";
+import { handleMusicInteraction, musicCommands } from "./music";
 
 const TOKEN = process.env["DISCORD_TOKEN"];
 const CLIENT_ID = process.env["CLIENT_ID"];
@@ -130,19 +131,12 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((command) => command.toJSON());
 
+commands.push(...musicCommands);
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-type GuildPlayback = {
-  connection: VoiceConnection;
-  player: AudioPlayer;
-  cleanupTimer?: NodeJS.Timeout;
-  voiceChannelId: string;
-  stayConnected: boolean;
-};
-
-const activePlayback = new Map<string, GuildPlayback>();
 const speechBlacklist = new Map<string, Set<string>>();
 const voicePreferences = new Map<string, VoiceKey>();
 const blacklistFile = path.resolve("data/speech-blacklist.json");
@@ -226,76 +220,6 @@ function hasSpeechModerationPermission(
   );
 }
 
-function destroyPlayback(guildId: string) {
-  const playback = activePlayback.get(guildId);
-  if (!playback) return;
-
-  if (playback.cleanupTimer) {
-    clearTimeout(playback.cleanupTimer);
-  }
-
-  playback.player.stop();
-  playback.connection.destroy();
-  activePlayback.delete(guildId);
-}
-
-function schedulePlaybackCleanup(guildId: string) {
-  const playback = activePlayback.get(guildId);
-  if (!playback || playback.stayConnected) return;
-
-  playback.cleanupTimer = setTimeout(() => {
-    const current = activePlayback.get(guildId);
-    if (current === playback && current.player.state.status === AudioPlayerStatus.Idle) {
-      destroyPlayback(guildId);
-    }
-  }, 1_000);
-}
-
-function createPlayback(
-  guildId: string,
-  voiceChannelId: string,
-  adapterCreator: Parameters<typeof joinVoiceChannel>[0]["adapterCreator"],
-  stayConnected: boolean,
-) {
-  const existing = activePlayback.get(guildId);
-
-  if (existing?.voiceChannelId === voiceChannelId) {
-    existing.stayConnected = existing.stayConnected || stayConnected;
-    return existing;
-  }
-
-  if (existing) {
-    destroyPlayback(guildId);
-  }
-
-  const connection = joinVoiceChannel({
-    channelId: voiceChannelId,
-    guildId,
-    adapterCreator,
-    selfDeaf: true,
-  });
-  const player = createAudioPlayer();
-  const playback: GuildPlayback = {
-    connection,
-    player,
-    voiceChannelId,
-    stayConnected,
-  };
-
-  activePlayback.set(guildId, playback);
-
-  player.on(AudioPlayerStatus.Idle, () => {
-    schedulePlaybackCleanup(guildId);
-  });
-  player.on("error", (error) => {
-    logger.error({ err: error, guildId }, "Audio playback error");
-    destroyPlayback(guildId);
-  });
-
-  connection.subscribe(player);
-  return playback;
-}
-
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(token);
   logger.info("Registering Discord slash commands");
@@ -321,6 +245,10 @@ client.on("interactionCreate", async (interaction) => {
       content: "This command can only be used in a server.",
       flags: MessageFlags.Ephemeral,
     });
+    return;
+  }
+
+  if (await handleMusicInteraction(interaction)) {
     return;
   }
 
